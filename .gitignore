@@ -169,3 +169,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Ignore files created from CatBoost package and creation of venv
+src/catboost_info/
+myenv/
+data/extracted/
+test.ipynb
