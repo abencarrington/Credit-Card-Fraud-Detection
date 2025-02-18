@@ -172,6 +172,8 @@ cython_debug/
 
 # Ignore files created from CatBoost package and creation of venv
 src/catboost_info/
+src/.DS_Store
 myenv/
 data/extracted/
 test.ipynb
+
