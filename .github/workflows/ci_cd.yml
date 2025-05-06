@@ -1,0 +1,356 @@
+name: Fraud Detection CI/CD
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      run_deploy:
+        description: 'Run deployment steps'
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9']
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pytest-cov flake8
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install -e .
+    
+    - name: Lint with flake8
+      run: |
+        # Stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Exit-zero treats all errors as warnings
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: Test with pytest
+      run: |
+        pytest --cov=fraud_detection tests/
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        fail_ci_if_error: false
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    
+    - name: Build package
+      run: |
+        python -m build
+    
+    - name: Store build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: dist
+        path: dist/
+
+  prepare-test-data:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.run_deploy == true
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install kaggle
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install -e .
+    
+    - name: Set up Kaggle credentials
+      run: |
+        mkdir -p ~/.kaggle
+        echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_KEY }}"}' > ~/.kaggle/kaggle.json
+        chmod 600 ~/.kaggle/kaggle.json
+    
+    - name: Download data
+      run: |
+        python scripts/download_data.py --output ./data/raw
+    
+    - name: Prepare processed data
+      run: |
+        python -m doit downcast_train downcast_test global_features_train global_features_test customer_features_train customer_features_test
+    
+    - name: Store processed data
+      uses: actions/upload-artifact@v3
+      with:
+        name: processed-data
+        path: data/processed/
+
+  train-models:
+    needs: prepare-test-data
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.run_deploy == true
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install -e .
+    
+    - name: Download processed data
+      uses: actions/download-artifact@v3
+      with:
+        name: processed-data
+        path: data/processed/
+    
+    - name: Train global model
+      run: |
+        mkdir -p models
+        mkdir -p artifacts/metrics
+        python -m fraud_detection.training.train_global \
+          --data_dir data/processed \
+          --input data/processed/features_global_train.csv \
+          --out_model models/global_vae.pt \
+          --out_dir artifacts/metrics \
+          --epochs 30 \
+          --batch_size 128
+    
+    - name: Train customer models (limited)
+      run: |
+        mkdir -p models/customers
+        python -m fraud_detection.training.train_customer \
+          --data_dir data/processed \
+          --input data/processed/features_customer_train.csv \
+          --global_model models/global_vae.pt \
+          --model_dir models/customers \
+          --metrics_dir artifacts/metrics \
+          --min_txns 100 \
+          --max_customers 10 \
+          --epochs 20
+    
+    - name: Store trained models
+      uses: actions/upload-artifact@v3
+      with:
+        name: trained-models
+        path: |
+          models/
+          artifacts/metrics/
+
+  evaluate-models:
+    needs: train-models
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.run_deploy == true
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install -e .
+    
+    - name: Download processed data
+      uses: actions/download-artifact@v3
+      with:
+        name: processed-data
+        path: data/processed/
+    
+    - name: Download trained models
+      uses: actions/download-artifact@v3
+      with:
+        name: trained-models
+        path: ./
+    
+    - name: Evaluate on test data
+      run: |
+        python scripts/model_evaluation.py \
+          --data-dir data/raw \
+          --model-dir models \
+          --output-dir artifacts/evaluation \
+          --max-customers 10 \
+          --skip-train
+    
+    - name: Generate predictions
+      run: |
+        python scripts/generate_predictions.py \
+          --data-dir data/raw \
+          --model-dir models \
+          --output-dir artifacts/predictions
+    
+    - name: Store evaluation results
+      uses: actions/upload-artifact@v3
+      with:
+        name: evaluation-results
+        path: |
+          artifacts/evaluation/
+          artifacts/predictions/
+
+  generate-dashboard:
+    needs: evaluate-models
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.run_deploy == true
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install -e .
+    
+    - name: Download evaluation results
+      uses: actions/download-artifact@v3
+      with:
+        name: evaluation-results
+        path: artifacts/
+    
+    - name: Download trained models
+      uses: actions/download-artifact@v3
+      with:
+        name: trained-models
+        path: ./
+    
+    - name: Generate dashboard assets
+      run: |
+        mkdir -p streamlit/assets
+        python -m doit generate_dashboard_assets
+    
+    - name: Store dashboard assets
+      uses: actions/upload-artifact@v3
+      with:
+        name: dashboard-assets
+        path: streamlit/assets/
+
+  deploy:
+    needs: [evaluate-models, generate-dashboard]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.run_deploy == true
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install -e .
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: ./artifacts-download/
+    
+    - name: Restore artifacts to correct locations
+      run: |
+        mkdir -p data/processed/
+        mkdir -p models/customers/
+        mkdir -p artifacts/metrics/
+        mkdir -p artifacts/evaluation/
+        mkdir -p artifacts/predictions/
+        mkdir -p streamlit/assets/
+        
+        cp -r ./artifacts-download/processed-data/* data/processed/
+        cp -r ./artifacts-download/trained-models/models/* models/
+        cp -r ./artifacts-download/trained-models/artifacts/* artifacts/
+        cp -r ./artifacts-download/evaluation-results/* artifacts/
+        cp -r ./artifacts-download/dashboard-assets/* streamlit/assets/
+    
+    - name: Prepare deployment package
+      run: |
+        mkdir -p deploy
+        cp -r fraud_detection deploy/
+        cp -r streamlit deploy/
+        cp -r models deploy/
+        cp -r artifacts deploy/
+        cp setup.py deploy/
+        cp requirements.txt deploy/
+        cp README.md deploy/
+    
+    - name: Create deployment artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: deployment-package
+        path: deploy/
+    
+    - name: Display deployment instructions
+      run: |
+        echo "Deployment package created successfully. To deploy:"
+        echo "1. Download the deployment-package artifact"
+        echo "2. Extract the package to your server"
+        echo "3. Install dependencies: pip install -r requirements.txt"
+        echo "4. Run the dashboard: cd streamlit && streamlit run app.py"
+
+  # This job ensures the pipeline reports success even if deployment is skipped
+  pipeline-complete:
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Pipeline status
+      run: |
+        echo "Fraud Detection CI/CD pipeline completed."
+        echo "Test and build status: ${{ needs.build.result }}"
+        if [ "${{ github.event_name }}" = "workflow_dispatch" && "${{ github.event.inputs.run_deploy }}" = "true" ]; then
+          echo "Full training and deployment pipeline executed."
+        else
+          echo "Deployment step was skipped. To run full pipeline, use workflow_dispatch with run_deploy=true"
+        fi
